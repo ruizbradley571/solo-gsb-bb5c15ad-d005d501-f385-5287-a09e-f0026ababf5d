@@ -4,7 +4,8 @@
 分析服务。客户端按 **设备序号 + 时间戳** 批量上报温度、湿度读数；服务对每个
 展柜独立执行**带惩罚项的确定性变点分段**，自动合并同序号重复上报，支持迟到
 读数补入后的时间线重放、锚点校准与“不落库”的重放预览；并提供基于
-**线性插值阈值交点**的越界剂量（excursion dose）事件查询。
+**线性插值阈值交点**的越界剂量（excursion dose）事件查询，以及基于各展柜
+非基线段首的**跨展柜共模突变**（common-mode incident）检测。
 
 ---
 
@@ -102,6 +103,40 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 - 至少需配置一个上下限；`temp_min > temp_max`、`humidity_min > humidity_max`、
   `start > end`、`max_gap ≤ 0` 均返回 `422`。
 
+### 7. 跨展柜共模突变
+
+`GET /api/v1/incidents` 把**各展柜现有有效分段**（已落库快照；尚未重放的
+展柜即时只读计算）中落在 `[start, end]` 内的**非基线段首**（`confidence`
+为 `high/medium/low` 的段起点）汇总起来，检测“多个展柜在很短时间内相继
+突变”的共模事件：
+
+1. 全部段首按 `(ts, device_sn)` 全局排序，取任意一段**连续段首**作为候选窗；
+2. 候选窗内最早与最晚边界之差 **不超过** `tolerance_seconds`（含等于）；
+3. 同一展柜在窗内若出现多个段首，**只保留幅度最大的一条**，幅度并列取
+   **时间更早**者；
+4. 去重后涉及的 distinct device 数达到 `min_devices` 时候选才合法
+   （`min_devices ≥ 2`）。
+
+枚举得到全部合法候选窗后，**不做贪心链式归并**，而是在候选全集上做
+**加权区间调度（动态规划）**，选出一组**互不重叠**事件（后一事件的
+`start_ts` 严格晚于前一事件的 `end_ts`；同一时刻的突变簇视为一个事件，
+不允许拆开）。选择按以下次序依次决定：
+
+1. 入选事件的**设备数总和**最大；
+2. 并列时**幅度总和**最大；
+3. 仍并列时，按开始时间排列的**起始时间序列**逐项比较、越早越优；序列构成
+   前缀并列时**更长者优先**——宁拆成更多个更早的事件，也不归并成一个大事件；
+4. 物理量完全并列时再以候选成员键字典序兜底，保证结果严格确定。
+
+响应返回每个事件的区间（成员中最早/最晚边界）、持续秒数、参与展柜数、
+**各展柜边界的方向与幅度**，以及各边界幅度之和 `total_magnitude`；事件按
+开始时间排序。边界方向 `up/down/flat` 以温、湿两个缩放加权跳变分量中
+占主导者的符号判定（温湿并列取温度）。
+
+`start > end`、`tolerance_seconds ≤ 0`、`min_devices < 2`（两个时间参数
+必填）均返回 `422`；库内没有读数或过滤后没有合法候选时返回 `200` 与空
+事件列表。
+
 ---
 
 ## 接口一览
@@ -113,6 +148,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | GET  | `/api/v1/cases/{sn}/segments` | 查询分段，支持 `start` / `end` 时间过滤 |
 | GET  | `/api/v1/cases/{sn}/timeline?max_points=...` | 时间线降采样读数，支持 `start` / `end` 时间过滤 |
 | GET  | `/api/v1/cases/{sn}/excursions` | 越界剂量事件：线性插值交点、分维剂量积分、`max_gap` 断开 |
+| GET  | `/api/v1/incidents` | 跨展柜共模突变：非基线段首候选窗 + 全局最优互不重叠选择 |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
 | GET  | `/api/v1/cases/{sn}/anchors` | 查询锚点及对齐情况 |
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
@@ -261,6 +297,57 @@ curl 'http://localhost:8080/api/v1/cases/CASE-007/excursions?temp_max=26&humidit
 `humidity_dose` 为事件内各维越界幅度对时间的累计积分；未触发某维度时对应
 剂量为 `0`、峰值字段为 `null`。
 
+### 跨展柜共模突变查询
+
+```bash
+curl 'http://localhost:8080/api/v1/incidents?start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z&tolerance_seconds=600&min_devices=2'
+```
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `start` / `end` | 是 | 含端点的 ISO8601 时间过滤；只有段首落在该闭区间内的非基线边界参与检测 |
+| `tolerance_seconds` | 是 | 候选事件最早/最晚边界跨度上限（秒，必须 **> 0**，含等于） |
+| `min_devices` | 是 | 合法候选要求的最少 distinct 展柜数（**≥ 2**） |
+
+响应示例（三个展柜在两分钟内同向跳变，归为一个共模事件）：
+
+```json
+{
+  "start": "2026-09-01T00:00:00Z",
+  "end": "2026-09-02T00:00:00Z",
+  "tolerance_seconds": 600.0,
+  "min_devices": 2,
+  "candidate_count": 4,
+  "boundary_count": 3,
+  "incident_count": 1,
+  "incidents": [
+    {
+      "start_ts": "2026-09-01T00:06:00Z",
+      "end_ts": "2026-09-01T00:08:00Z",
+      "duration_seconds": 120.0,
+      "device_count": 3,
+      "total_magnitude": 7.5,
+      "boundaries": [
+        {"device_sn": "CASE-A", "ts": "2026-09-01T00:06:00Z",
+         "direction": "up", "magnitude": 2.5,
+         "delta_temperature": 4.0, "delta_humidity": 15.0},
+        {"device_sn": "CASE-B", "ts": "2026-09-01T00:07:00Z",
+         "direction": "up", "magnitude": 2.5,
+         "delta_temperature": 4.0, "delta_humidity": 15.0},
+        {"device_sn": "CASE-C", "ts": "2026-09-01T00:08:00Z",
+         "direction": "up", "magnitude": 2.5,
+         "delta_temperature": 4.0, "delta_humidity": 15.0}
+      ]
+    }
+  ]
+}
+```
+
+`candidate_count` 为枚举得到的全部合法连续候选窗数量（同一展柜已按幅度
+去重、成员集合相同的窗去重）；`boundary_count` 为过滤后参与检测的非基线
+段首总数。事件区间即成员边界的最早/最晚时刻，`boundaries` 内每个展柜
+恰好一条且按 `(ts, device_sn)` 排序。
+
 ---
 
 ## 配置（环境变量）
@@ -293,4 +380,7 @@ python -m pytest -q
 **时间线降采样**（比例配额与余数稳定分派、强制点去重超预算返回 422 与
 `minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算），以及
 **越界剂量**（线性插值交点精确性、三角/矩形剂量积分、`max_gap` 断开与未知
-区间剔除、跨维度事件合并、参数校验 422 与空范围/未知设备）。
+区间剔除、跨维度事件合并、参数校验 422 与空范围/未知设备），以及
+**跨展柜共模突变**（连续候选窗枚举、容差含等于、同展柜保留最大幅度/并列
+取更早、`min_devices` 过滤、动态规划全局最优相对贪心链式归并的差异、
+起始时间序列并列规则、严格互不重叠、方向判定、参数校验 422 与空库/空范围）。

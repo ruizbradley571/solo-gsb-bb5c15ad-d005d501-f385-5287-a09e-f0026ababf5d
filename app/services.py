@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from . import excursions as exc
+from . import incidents as inc
 from . import segmentation as seg
 from . import timeline as tl
 from .config import settings
@@ -17,6 +18,9 @@ from .schemas import (
     AnchorIn,
     ExcursionEventOut,
     ExcursionsOut,
+    IncidentBoundaryOut,
+    IncidentOut,
+    IncidentsOut,
     ReadingIn,
     SegmentOut,
     SegmentationOut,
@@ -506,6 +510,86 @@ def build_case_excursions(
                 peak_humidity_ts=e.peak_humidity_ts,
             )
             for e in events
+        ],
+    )
+
+
+# ---------- 跨展柜共模突变 ----------
+
+
+def list_device_sns(db: Session) -> list[str]:
+    """库内有读数的全部展柜序号（即便尚未重放、没有 CaseState 也包含）。"""
+    rows = db.scalars(select(Reading.device_sn).distinct()).all()
+    return sorted(rows)
+
+
+def build_incidents(
+    db: Session,
+    start: dt.datetime,
+    end: dt.datetime,
+    tolerance_seconds: float,
+    min_devices: int,
+) -> IncidentsOut:
+    """基于各展柜现有有效分段的非基线段首，检测跨展柜共模突变。
+
+    段首取自已落库分段快照；展柜尚未重放时即时只读计算（不落库）。
+    段首时间戳落在闭区间 ``[start, end]`` 内才参与检测。候选枚举、
+    同展柜取最大幅度边界与全局最优选择全部委托 :mod:`app.incidents`。
+    """
+    boundaries: list[inc.Boundary] = []
+    for device_sn in list_device_sns(db):
+        segmentation = get_effective_segmentation(db, device_sn)
+        if segmentation is None:
+            continue
+        for s in segmentation.segments:
+            if s.confidence == "baseline":
+                continue  # 只取非基线段首
+            if start <= s.start_ts <= end:
+                boundaries.append(
+                    inc.Boundary(
+                        device_sn=device_sn,
+                        ts=s.start_ts,
+                        magnitude=s.magnitude,
+                        delta_temperature=s.delta_temperature,
+                        delta_humidity=s.delta_humidity,
+                    )
+                )
+
+    candidates = inc.enumerate_incidents(
+        boundaries, tolerance_seconds, min_devices
+    )
+    selected = inc.select_incidents(candidates)
+
+    return IncidentsOut(
+        start=start,
+        end=end,
+        tolerance_seconds=tolerance_seconds,
+        min_devices=min_devices,
+        candidate_count=len(candidates),
+        boundary_count=len(boundaries),
+        incident_count=len(selected),
+        incidents=[
+            IncidentOut(
+                start_ts=e.start_ts,
+                end_ts=e.end_ts,
+                duration_seconds=e.duration_seconds,
+                device_count=e.device_count,
+                total_magnitude=e.total_magnitude,
+                boundaries=[
+                    IncidentBoundaryOut(
+                        device_sn=b.device_sn,
+                        ts=b.ts,
+                        direction=inc.boundary_direction(
+                            b.delta_temperature, b.delta_humidity
+                        ),
+                        magnitude=b.magnitude,
+                        delta_temperature=b.delta_temperature,
+                        delta_humidity=b.delta_humidity,
+                    )
+                    for b in e.members
+                ],
+            )
+            for e in selected
         ],
     )
 

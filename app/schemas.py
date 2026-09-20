@@ -197,6 +197,44 @@ class ExcursionsOut(BaseModel):
     events: list[ExcursionEventOut]
 
 
+IncidentDirection = Literal["up", "down", "flat"]
+
+
+class IncidentBoundaryOut(BaseModel):
+    device_sn: str
+    ts: dt.datetime = Field(..., description="该展柜非基线段段首（突变发生时刻）")
+    direction: IncidentDirection = Field(
+        ..., description="边界方向：以占主导的温/湿跳变分量符号判定"
+    )
+    magnitude: float = Field(..., description="该边界的缩放加权变化幅度")
+    delta_temperature: float
+    delta_humidity: float
+
+
+class IncidentOut(BaseModel):
+    start_ts: dt.datetime = Field(..., description="事件区间起点（成员中最早的边界）")
+    end_ts: dt.datetime = Field(..., description="事件区间终点（成员中最晚的边界）")
+    duration_seconds: float = Field(..., description="事件跨度（end_ts - start_ts，秒）")
+    device_count: int = Field(..., description="参与该事件的 distinct 展柜数")
+    total_magnitude: float = Field(..., description="各展柜边界幅度之和")
+    boundaries: list[IncidentBoundaryOut] = Field(
+        ..., description="各展柜保留的边界（每个展柜一条），按 (ts, device_sn) 排序"
+    )
+
+
+class IncidentsOut(BaseModel):
+    start: dt.datetime = Field(..., description="实际生效的起始过滤（UTC）")
+    end: dt.datetime = Field(..., description="实际生效的结束过滤（UTC）")
+    tolerance_seconds: float = Field(..., description="候选窗允许的最大边界跨度（秒）")
+    min_devices: int = Field(..., description="合法候选要求的最少 distinct 展柜数")
+    candidate_count: int = Field(
+        ..., description="枚举得到的全部合法连续候选窗数量（去重后）"
+    )
+    boundary_count: int = Field(..., description="过滤后参与检测的非基线段首数量")
+    incident_count: int
+    incidents: list[IncidentOut]
+
+
 class HealthOut(BaseModel):
     status: str
     db: str
