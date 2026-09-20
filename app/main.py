@@ -20,6 +20,7 @@ from .schemas import (
     CaseOut,
     ExcursionsOut,
     HealthOut,
+    IncidentsOut,
     IngestResponse,
     IngestSummary,
     ReadingIn,
@@ -51,9 +52,10 @@ app = FastAPI(
         "接收带设备序号与时间戳的温湿度读数，按惩罚项对每个展柜执行"
         "确定性变点分段；合并同序号重复上报，支持迟到读数补入后的"
         "时间线重放、锚点校准与无写库重放预览；并提供基于线性插值的"
-        "越界剂量（excursion dose）事件查询。"
+        "越界剂量（excursion dose）事件查询，以及基于各展柜有效分段"
+        "非基线段首的跨展柜共模突变事件查询。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -269,6 +271,41 @@ def get_excursions(
     if out is None:
         raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
     return out
+
+
+# ---------- 跨展柜共模突变事件 ----------
+
+
+@app.get(
+    "/api/v1/incidents",
+    response_model=IncidentsOut,
+    tags=["incidents"],
+    summary="跨展柜共模突变事件（有效分段非基线段首 + 全局选择）",
+)
+def get_incidents(
+    start: dt.datetime | None = Query(None, description="起始时间（含），ISO8601"),
+    end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
+    tolerance_seconds: float = Query(
+        300.0,
+        description="候选窗容差（秒）：候选事件最早与最晚边界之差的上限，必须为正",
+    ),
+    min_devices: int = Query(
+        2, description="候选事件最少 distinct device 数，至少为 2"
+    ),
+    db: Session = Depends(get_db),
+):
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc is not None and end_utc is not None and start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+    if tolerance_seconds <= 0:
+        raise HTTPException(status_code=422, detail="tolerance_seconds 必须为正数")
+    if min_devices < 2:
+        raise HTTPException(status_code=422, detail="min_devices 不能小于 2")
+
+    return services.build_incidents(
+        db, start_utc, end_utc, tolerance_seconds, min_devices
+    )
 
 
 # ---------- 锚点校准 ----------

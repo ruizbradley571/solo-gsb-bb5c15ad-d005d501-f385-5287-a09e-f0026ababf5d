@@ -4,7 +4,8 @@
 分析服务。客户端按 **设备序号 + 时间戳** 批量上报温度、湿度读数；服务对每个
 展柜独立执行**带惩罚项的确定性变点分段**，自动合并同序号重复上报，支持迟到
 读数补入后的时间线重放、锚点校准与“不落库”的重放预览；并提供基于
-**线性插值阈值交点**的越界剂量（excursion dose）事件查询。
+**线性插值阈值交点**的越界剂量（excursion dose）事件查询，以及基于各展柜
+有效分段**非基线段首**的**跨展柜共模突变事件**查询。
 
 ---
 
@@ -102,6 +103,26 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 - 至少需配置一个上下限；`temp_min > temp_max`、`humidity_min > humidity_max`、
   `start > end`、`max_gap ≤ 0` 均返回 `422`。
 
+### 7. 跨展柜共模突变事件
+
+`GET /api/v1/incidents` 在 `[start, end]` 内寻找多个展柜**几乎同时**发生的
+突变（共模事件）。边界取自每个展柜**现有有效分段**（已落库快照；尚无快照但
+有读数时即时只读计算）的**非基线段首**，每条边界携带跳变方向与缩放加权幅度：
+
+1. 全部边界按 `(ts, device_sn)` 升序排列，**候选事件**为其上的连续窗口，
+   窗口内最早与最晚边界之差不得超过 `tolerance_seconds`；
+2. 同一展柜在同一候选中只保留**幅度最大**的边界，并列时取**更早**者；
+3. 去重后 distinct device 数少于 `min_devices`（≥ 2）的候选无效；
+4. 对全部合法连续候选窗做**全局选择**（带权区间调度的精确动态规划，
+   **不做贪心链式归并**）：依次以 **设备数总和** 最大、**幅度总和** 最大、
+   **起始时间序列** 字典序最小（越早越优）决胜，选出互不重叠
+   （窗口下标区间不相交）的事件集合。
+
+响应按事件开始时间排序，每个事件给出区间（最早/最晚边界）、`device_count`、
+汇总幅度 `total_magnitude`，以及各展柜保留边界的 `direction`（温湿度缩放
+加权合成变化的符号：`up` / `down`）、`magnitude` 与两个量纲的跳变量。
+`start > end`、`tolerance_seconds ≤ 0`、`min_devices < 2` 均返回 `422`。
+
 ---
 
 ## 接口一览
@@ -113,6 +134,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | GET  | `/api/v1/cases/{sn}/segments` | 查询分段，支持 `start` / `end` 时间过滤 |
 | GET  | `/api/v1/cases/{sn}/timeline?max_points=...` | 时间线降采样读数，支持 `start` / `end` 时间过滤 |
 | GET  | `/api/v1/cases/{sn}/excursions` | 越界剂量事件：线性插值交点、分维剂量积分、`max_gap` 断开 |
+| GET  | `/api/v1/incidents` | 跨展柜共模突变事件：有效分段非基线段首 + 容差窗候选 + 全局选择 |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
 | GET  | `/api/v1/cases/{sn}/anchors` | 查询锚点及对齐情况 |
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
@@ -261,6 +283,49 @@ curl 'http://localhost:8080/api/v1/cases/CASE-007/excursions?temp_max=26&humidit
 `humidity_dose` 为事件内各维越界幅度对时间的累计积分；未触发某维度时对应
 剂量为 `0`、峰值字段为 `null`。
 
+### 跨展柜共模突变事件查询
+
+```bash
+curl 'http://localhost:8080/api/v1/incidents?start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z&tolerance_seconds=300&min_devices=2'
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `start` / `end` | 不限 | 含端点的 ISO8601 过滤；只有落在范围内的边界参与候选 |
+| `tolerance_seconds` | `300` | 候选窗容差（秒，必须为正）：候选事件最早与最晚边界之差的上限 |
+| `min_devices` | `2` | 候选事件最少 distinct device 数（至少为 2） |
+
+`start` 晚于 `end`、`tolerance_seconds` 非正、`min_devices < 2` 均返回 `422`。
+响应示例（两个展柜在容差内同向跳变，合并为一个共模事件）：
+
+```json
+{
+  "start": "2026-09-01T00:00:00Z",
+  "end": "2026-09-02T00:00:00Z",
+  "tolerance_seconds": 300.0,
+  "min_devices": 2,
+  "boundary_count": 2,
+  "event_count": 1,
+  "events": [
+    {
+      "start_ts": "2026-09-01T01:20:00Z",
+      "end_ts": "2026-09-01T01:22:00Z",
+      "device_count": 2,
+      "total_magnitude": 4.0,
+      "boundaries": [
+        {"device_sn": "CASE-007", "ts": "2026-09-01T01:20:00Z", "direction": "up",
+         "magnitude": 2.0, "delta_temperature": 4.0, "delta_humidity": 0.0},
+        {"device_sn": "CASE-009", "ts": "2026-09-01T01:22:00Z", "direction": "up",
+         "magnitude": 2.0, "delta_temperature": 4.0, "delta_humidity": 0.0}
+      ]
+    }
+  ]
+}
+```
+
+`boundary_count` 为时间范围内参与候选枚举的边界总数；事件按 `start_ts`
+升序返回，全程只读计算、不写库。
+
 ---
 
 ## 配置（环境变量）
@@ -291,6 +356,9 @@ python -m pytest -q
 锚点强制边界、时间范围查询、**预览不写库**（含待预览读数与库内重复、
 请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例），
 **时间线降采样**（比例配额与余数稳定分派、强制点去重超预算返回 422 与
-`minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算），以及
+`minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算），
 **越界剂量**（线性插值交点精确性、三角/矩形剂量积分、`max_gap` 断开与未知
-区间剔除、跨维度事件合并、参数校验 422 与空范围/未知设备）。
+区间剔除、跨维度事件合并、参数校验 422 与空范围/未知设备），以及
+**跨展柜共模突变事件**（容差窗候选枚举、同展柜幅度最大去重与并列取早、
+`min_devices` 过滤、设备数/幅度/起始时间序列的全局选择、反贪心链式归并、
+方向判定、参数校验 422 与空库/未重放展柜的即时计算）。

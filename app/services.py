@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from . import excursions as exc
+from . import incidents as inc
 from . import segmentation as seg
 from . import timeline as tl
 from .config import settings
@@ -17,6 +18,9 @@ from .schemas import (
     AnchorIn,
     ExcursionEventOut,
     ExcursionsOut,
+    IncidentBoundaryOut,
+    IncidentEventOut,
+    IncidentsOut,
     ReadingIn,
     SegmentOut,
     SegmentationOut,
@@ -504,6 +508,76 @@ def build_case_excursions(
                 peak_temperature_ts=e.peak_temperature_ts,
                 peak_humidity=e.peak_humidity,
                 peak_humidity_ts=e.peak_humidity_ts,
+            )
+            for e in events
+        ],
+    )
+
+
+# ---------- 跨展柜共模突变事件 ----------
+
+
+def build_incidents(
+    db: Session,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    tolerance_seconds: float,
+    min_devices: int,
+) -> IncidentsOut:
+    """跨展柜共模突变事件（只读计算，不落库）。
+
+    边界取自每个展柜**现有有效分段**（已落库快照；尚无快照但有读数时
+    即时只读计算）的非基线段首，经 ``[start, end]``（含端点）过滤后
+    做候选枚举与全局选择。
+    """
+    device_sns = set(db.scalars(select(Reading.device_sn).distinct()).all())
+    device_sns.update(state.device_sn for state in list_cases(db))
+
+    boundaries: list[inc.Boundary] = []
+    for device_sn in sorted(device_sns):
+        segmentation = get_effective_segmentation(db, device_sn)
+        if segmentation is None:
+            continue
+        for s in segmentation.segments[1:]:  # 非基线段首即变点边界
+            if start is not None and s.start_ts < start:
+                continue
+            if end is not None and s.start_ts > end:
+                continue
+            boundaries.append(
+                inc.Boundary(
+                    device_sn=device_sn,
+                    ts=s.start_ts,
+                    magnitude=s.magnitude,
+                    delta_temperature=s.delta_temperature,
+                    delta_humidity=s.delta_humidity,
+                )
+            )
+
+    events = inc.compute_incidents(boundaries, tolerance_seconds, min_devices)
+    return IncidentsOut(
+        start=start,
+        end=end,
+        tolerance_seconds=tolerance_seconds,
+        min_devices=min_devices,
+        boundary_count=len(boundaries),
+        event_count=len(events),
+        events=[
+            IncidentEventOut(
+                start_ts=e.start_ts,
+                end_ts=e.end_ts,
+                device_count=e.device_count,
+                total_magnitude=e.total_magnitude,
+                boundaries=[
+                    IncidentBoundaryOut(
+                        device_sn=b.device_sn,
+                        ts=b.ts,
+                        direction=b.direction,
+                        magnitude=b.magnitude,
+                        delta_temperature=b.delta_temperature,
+                        delta_humidity=b.delta_humidity,
+                    )
+                    for b in e.boundaries
+                ],
             )
             for e in events
         ],
